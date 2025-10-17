@@ -29,7 +29,7 @@ class TarotsAction(BaseAction):
     # 双激活类型配置
     focus_activation_type = ActionActivationType.LLM_JUDGE
     normal_activation_type = ActionActivationType.KEYWORD
-    activation_keywords = ["抽一张塔罗牌", "抽张塔罗牌", "塔罗占卜", "塔罗牌"]
+    activation_keywords = ["抽一张塔罗牌", "抽张塔罗牌", "塔罗占卜", "塔罗牌", "占卜", "算一卦"]
     keyword_case_sensitive = False
 
     # 模式和并行控制
@@ -153,6 +153,7 @@ class TarotsAction(BaseAction):
     
             # 结果处理
             result_text = f"【{formation_name}牌阵 - {self.using_cards}牌组】\n"
+            card_details = []  # 存储详细的卡牌信息用于AI解读
             failed_images = []  # 记录获取失败的图片
             
             # 解析目标用户信息
@@ -174,7 +175,10 @@ class TarotsAction(BaseAction):
                     continue
                     
                 card_info = card_data.get("info", {})
-                pos_name = represent_list[0][idx] if idx < len(represent_list[0]) else f"位置{idx+1}"
+                
+                # 安全获取位置名称和含义
+                pos_name = self._get_position_name(represent_list, idx, formation_name)
+                pos_meaning = self._get_position_meaning(represent_list, idx, formation_name)
                 
                 # 发送图片
                 img_success = await self._send_card_image(card_id, is_reverse)
@@ -188,6 +192,16 @@ class TarotsAction(BaseAction):
                     f"\n{pos_name} - {'逆位' if is_reverse else '正位'} {card_data.get('name', '未知')}\n"
                     f"{desc[:100]}...\n"
                 )
+                
+                # 存储详细卡牌信息用于AI解读
+                card_details.append({
+                    'position': pos_name,
+                    'name': card_data.get('name', '未知'),
+                    'is_reverse': is_reverse,
+                    'description': desc,
+                    'position_meaning': pos_meaning
+                })
+                
                 await asyncio.sleep(0.3)  # 防止消息频率限制
 
             if failed_images:
@@ -200,17 +214,23 @@ class TarotsAction(BaseAction):
             
             # 使用AI重新组织回复
             try:
-                ai_response = await self._generate_ai_reply(result_text)
+                ai_response = await self._generate_ai_interpretation(card_details, formation_name, user_nickname)
                 
                 if ai_response:
+                    # 发送AI解读结果
                     await self.send_text(ai_response)
+                    
+                    # 如果配置了显示原始文本，也发送原始结果
+                    if self.config["adjustment"].get("enable_original_text", False):
+                        await asyncio.sleep(0.5)
+                        await self.send_text(f"📜 原始牌面信息：\n{result_text}")
                 else:
                     # 如果AI生成失败，发送原始结果
-                    await self.send_text(result_text)
+                    await self.send_text(f"🔮 塔罗牌启示：\n\n{result_text}\n\n愿这些牌面给你带来启示和力量～")
                     
             except Exception as e:
                 logger.error(f"AI回复生成失败: {e}")
-                await self.send_text(result_text)
+                await self.send_text(f"🔮 塔罗牌启示：\n\n{result_text}\n\n愿这些牌面给你带来启示和力量～")
 
             # 记录动作信息
             await self.store_action_info(
@@ -227,31 +247,125 @@ class TarotsAction(BaseAction):
             await self.send_text(f"❌ 占卜失败: {str(e)}")
             return False, "执行错误"
 
-    async def _generate_ai_reply(self, original_text: str) -> Optional[str]:
-        """生成AI回复 - 简化版本"""
+    def _get_position_name(self, represent_list: List, idx: int, formation_name: str) -> str:
+        """安全获取位置名称"""
         try:
-            # 使用框架的聊天API生成回复
-            prompt = f"""请根据以下塔罗牌占卜结果，用温暖、神秘的语气为用户解牌：
+            if (isinstance(represent_list, list) and len(represent_list) > 0 and 
+                isinstance(represent_list[0], list) and idx < len(represent_list[0])):
+                return represent_list[0][idx]
+        except (IndexError, TypeError):
+            pass
+        return f"位置{idx+1}"
 
-{original_text}
+    def _get_position_meaning(self, represent_list: List, idx: int, formation_name: str) -> str:
+        """安全获取位置含义"""
+        try:
+            if (isinstance(represent_list, list) and len(represent_list) > 1 and 
+                isinstance(represent_list[1], list) and idx < len(represent_list[1])):
+                return represent_list[1][idx]
+        except (IndexError, TypeError):
+            pass
+        
+        # 根据牌阵类型提供默认含义
+        default_meanings = {
+            "单张": "当前状况或问题的核心",
+            "圣三角": ["过去", "现在", "未来"],
+            "时间之流": ["过去", "现在", "未来"],
+            "四要素": ["火-行动", "水-情感", "风-思想", "土-物质"],
+            "五牌阵": ["现状", "挑战", "最佳选择", "环境", "结果"],
+            "吉普赛十字": ["现状", "障碍", "目标", "过去", "未来"],
+            "马蹄": ["过去", "现在", "隐藏因素", "环境", "期望", "结果"],
+            "六芒星": ["过去", "现在", "未来", "原因", "环境", "结果"]
+        }
+        
+        if formation_name in default_meanings:
+            meanings = default_meanings[formation_name]
+            if isinstance(meanings, list) and idx < len(meanings):
+                return meanings[idx]
+            elif isinstance(meanings, str):
+                return meanings
+        
+        return "未知含义"
 
-请用亲切友好的语气解释牌面含义，给用户一些积极的建议和启示："""
+    async def _generate_ai_interpretation(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> Optional[str]:
+        """生成AI自然语言解读"""
+        try:
+            # 构建详细的解读提示词
+            prompt = self._build_interpretation_prompt(card_details, formation_name, user_nickname)
             
-            # 使用聊天API（根据实际框架API调整）
-            if hasattr(self, 'chat_api') and self.chat_api:
-                response = await self.chat_api.generate_response(
+            # 使用聊天API生成回复
+            if hasattr(chat_api, 'generate_response'):
+                response = await chat_api.generate_response(
                     prompt=prompt,
                     context=self.chat_stream,
-                    max_tokens=500
+                    max_tokens=800,
+                    temperature=0.8
                 )
                 return response
             else:
-                # 如果聊天API不可用，返回原始文本的简化版本
-                return f"🔮 塔罗牌启示：\n\n{original_text}\n\n愿这些牌面给你带来启示和力量～"
+                # 如果聊天API不可用，使用备用解读
+                return self._generate_fallback_interpretation(card_details, formation_name, user_nickname)
                 
         except Exception as e:
-            logger.error(f"AI回复生成错误: {e}")
+            logger.error(f"AI解读生成错误: {e}")
             return None
+
+    def _build_interpretation_prompt(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> str:
+        """构建解读提示词"""
+        cards_info = ""
+        for card in card_details:
+            position_desc = f"{card['position']}（代表{card['position_meaning']}）"
+            status = "逆位" if card['is_reverse'] else "正位"
+            cards_info += f"- {position_desc}：{card['name']}（{status}）\n  含义：{card['description']}\n\n"
+
+        prompt = f"""你是一位资深的塔罗牌占卜师，请为{user_nickname}进行塔罗牌解读。
+
+牌阵：{formation_name}
+抽到的卡牌信息：
+{cards_info}
+
+请根据以上信息，用温暖、亲切、富有诗意的语言为用户进行解读：
+
+1. 首先用一句神秘而温暖的开场白开始
+2. 分析每张牌在各自位置上的含义，结合牌阵的整体能量
+3. 重点解读逆位牌的特殊含义和警示
+4. 给出整体的运势分析和建议
+5. 用积极鼓励的话语结束解读
+
+请使用自然的口语化表达，避免过于专业的术语，让用户感受到关怀和启发。可以适当使用emoji增加亲和力。
+
+你的解读："""
+
+        return prompt
+
+    def _generate_fallback_interpretation(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> str:
+        """生成备用解读（当AI不可用时）"""
+        interpretation = f"🔮 亲爱的{user_nickname}，让我为你解读这次的塔罗牌～\n\n"
+        
+        # 分析每张牌
+        reverse_cards = [card for card in card_details if card['is_reverse']]
+        normal_cards = [card for card in card_details if not card['is_reverse']]
+        
+        if reverse_cards:
+            interpretation += f"🌟 在这次{formation_name}牌阵中，你抽到了{len(reverse_cards)}张逆位牌，这提醒你要特别留意某些方面的平衡。\n\n"
+        
+        for card in card_details:
+            status_emoji = "⚠️" if card['is_reverse'] else "✨"
+            interpretation += f"{status_emoji} **{card['position']}** - {card['name']}{'（逆位）' if card['is_reverse'] else ''}\n"
+            interpretation += f"   这代表着{card['position_meaning']}，{card['description']}\n\n"
+        
+        # 整体建议
+        interpretation += "💫 **整体启示**：\n"
+        if len(normal_cards) > len(reverse_cards):
+            interpretation += "牌面整体能量积极，当前时机对你有利，请保持信心继续前进～"
+        elif len(reverse_cards) > len(normal_cards):
+            interpretation += "牌面提醒你需要更多反思和调整，但这也是成长的契机，相信你能处理好！"
+        else:
+            interpretation += "牌面能量平衡，既有挑战也有机遇，保持平和心态最重要～"
+        
+        interpretation += f"\n\n愿塔罗的智慧为{user_nickname}带来光明与指引 🌟"
+        
+        return interpretation
 
     def _get_card_range(self, card_type: str) -> list:
         """获取卡牌范围"""
@@ -333,7 +447,8 @@ class TarotsAction(BaseAction):
                     "use_cards": config_data.get("cards", {}).get("use_cards", ['bilibili','east'])
                 },
                 "adjustment": {
-                    "enable_original_text": config_data.get("adjustment", {}).get("enable_original_text", False)
+                    "enable_original_text": config_data.get("adjustment", {}).get("enable_original_text", False),
+                    "ai_interpretation": config_data.get("adjustment", {}).get("ai_interpretation", True)
                 }
             }
             return config
@@ -344,7 +459,10 @@ class TarotsAction(BaseAction):
                 "permissions": {"admin_users": []},
                 "proxy": {"enable_proxy": False, "proxy_url": ""},
                 "cards": {"using_cards": "bilibili", "use_cards": ["bilibili", "east"]},
-                "adjustment": {"enable_original_text": False}
+                "adjustment": {
+                    "enable_original_text": False,
+                    "ai_interpretation": True
+                }
             }
         
     def get_available_card_type(self, user_requested_type):
@@ -434,6 +552,7 @@ class TarotsAction(BaseAction):
         except Exception as e:
             logger.error(f"更新使用牌组失败: {e}")
 
+# TarotsCommand 类保持不变（与之前相同）
 class TarotsCommand(BaseCommand):
     command_name = "tarots"
     command_description = "塔罗牌管理命令"
@@ -606,9 +725,9 @@ class TarotsPlugin(BasePlugin):
     dependencies = []
     python_dependencies = ["Pillow", "aiohttp", "tomlkit"]
 
-    plugin_description = "塔罗牌占卜插件，支持多种牌阵和卡牌类型"
-    plugin_version = "2.1.1"
-    plugin_author = "升级版 - 本地牌库"
+    plugin_description = "塔罗牌占卜插件，支持多种牌阵和卡牌类型，提供智能AI解读"
+    plugin_version = "2.2.1"
+    plugin_author = "升级版 - 智能解读"
 
     config_section_descriptions = {
         "plugin": "插件基本配置",
@@ -621,7 +740,7 @@ class TarotsPlugin(BasePlugin):
 
     config_schema = {
         "plugin": {
-            "config_version": ConfigField(type=str, default="2.1.1", description="配置文件版本"),
+            "config_version": ConfigField(type=str, default="2.2.1", description="配置文件版本"),
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
         },
         "components": {
@@ -637,7 +756,8 @@ class TarotsPlugin(BasePlugin):
             "use_cards": ConfigField(type=list, default=['bilibili','east'], description="可用牌组列表")
         },
         "adjustment": {
-            "enable_original_text": ConfigField(type=bool, default=False, description="启用原始文本显示")
+            "enable_original_text": ConfigField(type=bool, default=False, description="启用原始文本显示"),
+            "ai_interpretation": ConfigField(type=bool, default=True, description="启用AI智能解读")
         },
         "permissions": {
             "admin_users": ConfigField(type=list, default=["123456789"], description="管理员用户ID列表")
