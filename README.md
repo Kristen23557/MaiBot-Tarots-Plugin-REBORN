@@ -1,4 +1,4 @@
-# MaiBot-Tarot-Action-plugins
+# MaiBot_Tarots_Plugin_REBORN
 塔罗牌插件 复活版1.0.0版本正式发布！
 
 ![QQ_1751117187452](https://github.com/user-attachments/assets/3eb9b721-aa41-4edb-86bf-fe9cf84fdcb9)
@@ -12,6 +12,7 @@
 **塔罗牌插件现在已实现牌组的解耦，现在可以自由编写添加自己的牌组了，详见[说明文档](https://github.com/A0000Xz/MaiBot-Tarots-Plugin/blob/main/help.md)（需要一定动手能力和技术能力）**
 
 插件内不自带卡组，需要自行下载放入卡组文件夹，命名规则必须严格遵循示例卡组文件
+牌组文件链接（度盘）：https://pan.baidu.com/s/1iPGeAtIUZggh0oxeKggBFQ?pwd=2357 提取码: 2357
 
 原插件参考了https://github.com/FloatTech/ZeroBot-Plugin
 此版本为对原插件https://github.com/A0000Xz/MaiBot-Tarots-Plugin进行向上兼容
@@ -36,3 +37,7 @@
 
 在向上兼容这个插件的时候没有事先联系原作者和相关人员，若有不妥请联系（QQ 2785185004）谢谢
 没了，因为他是懒B
+
+复活版修订教程：
+从code下载整个分支，解压后的一个文件夹直接放入plugins文件夹内，下载牌组文件，牌组文件内包含一个文件夹（tarots_jsons），解压整个放进插件文件夹内即可
+关于自定义牌组：复活版还没测试自定义牌组功能是否正常，不过你可以试试，和旧版本添加新牌组方法相同，但是因为仅限本地牌面（方便那些maibot连不上github的人）所以需要你提前准备好牌面文件并按照示例牌组里的命名方式命名文件
