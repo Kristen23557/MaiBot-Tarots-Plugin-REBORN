@@ -1,20 +1,18 @@
 {
-  "manifest_version": 1,
-  "name": "塔罗牌插件(0.10.3复活版)",
-  "version": "1.0.0",
-  "description": "提供高版本塔罗牌占卜功能，牌面为BiliBili幻星集",
-  "author": {
-    "name": "KArabella",
-    "url": "https://github.com/Kristen23557"
-  },
-  "license": "AGPL-v3.0",
-  "host_application": {
-    "min_version": "0.10.0",
-    "max_version": "0.10.3"
-  },
-  "keywords": ["tarot", "divination","moderation","bilibili"],
-  "categories": ["Entertainment & Interaction"],
-  "repository_url": "https://github.com/Kristen23557/MaiBot-Tarots-Plugin-REBORN/",
-  "default_locale": "zh-CN",
-  "locales_path": "_locales"
+    "manifest_version": 1,
+    "name": "MaiBot-Tarots-Plugin-REBORN",
+    "version": "1.0.0",
+    "description": "提供高版本塔罗牌占卜功能,默认牌面为BiliBili幻星集",
+    "host_application": {
+        "min_version": "0.10.0"
+    },
+    "author": {
+        "name": "KArabella",
+        "url": "https://github.com/Kristen23557"
+    },
+    "license": "MIT",
+    "homepage_url": "https://github.com/Kristen23557",
+    "repository_url": "https://github.com/Kristen23557/MaiBot-Tarots-Plugin-REBORN",
+    
+    "default_locale": "CN"
 }
