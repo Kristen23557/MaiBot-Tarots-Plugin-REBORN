@@ -1,55 +1,40 @@
-from src.plugin_system import (
-    BasePlugin, register_plugin, BaseAction, BaseCommand,
-    ComponentInfo, ActionActivationType, ChatMode, ConfigField
-)
-from src.plugin_system.apis import send_api, database_api, chat_api
-from src.common.database.database_model import Messages, PersonInfo
-from src.common.logger import get_logger
-from src.config.config import global_config
-from PIL import Image
-from typing import Tuple, Dict, Optional, List, Any, Type
-from pathlib import Path
-import traceback
-import tomlkit
-import json
+from typing import List, Tuple, Type, Any, Dict, Optional
 import random
 import asyncio
-import aiohttp
+import json
 import base64
 import toml
-import io
+import tomlkit
+import traceback
+from pathlib import Path
 import os
-import re
+
+# 导入新版插件系统
+from src.plugin_system import BasePlugin, register_plugin, ComponentInfo, ActionActivationType
+from src.plugin_system.base.config_types import ConfigField
+from src.plugin_system.base.base_action import BaseAction
+from src.plugin_system.apis import llm_api
+from src.common.logger import get_logger
 
 logger = get_logger("tarots")
 
 class TarotsAction(BaseAction):
+    """塔罗牌占卜动作 - 直接发送图片和简短解读"""
+    
     action_name = "tarots"
-
-    # 双激活类型配置
-    focus_activation_type = ActionActivationType.LLM_JUDGE
-    normal_activation_type = ActionActivationType.KEYWORD
+    
+    # 激活配置
+    activation_type = ActionActivationType.KEYWORD
     activation_keywords = ["抽一张塔罗牌", "抽张塔罗牌", "塔罗占卜", "塔罗牌", "占卜", "算一卦"]
     keyword_case_sensitive = False
 
-    # 模式和并行控制
-    mode_enable = ChatMode.ALL
-    parallel_action = False
-
-    action_description = "执行塔罗牌占卜，支持多种抽牌方式"
+    # 动作描述
+    action_description = "执行塔罗牌占卜，立即发送牌面图片并进行简短解读"
     action_parameters = {
         "card_type": "塔罗牌的抽牌范围，必填，只能填一个参数，这里请根据用户的要求填'全部'或'大阿卡纳'或'小阿卡纳'，如果用户的要求并不明确，默认填'全部'",
         "formation": "塔罗牌的抽牌方式，必填，只能填一个参数，这里请根据用户的要求填'单张'或'圣三角'或'时间之流'或'四要素'或'五牌阵'或'吉普赛十字'或'马蹄'或'六芒星'，如果用户的要求并不明确，默认填'单张'",
-        "target_message": "提出抽塔罗牌的对方的发言内容，格式必须为：（用户名:发言内容），若不清楚是回复谁的话可以为None"
+        "target_user": "提出抽塔罗牌的用户名"
     }
-    action_require = [
-        "当消息包含'抽塔罗牌''塔罗牌占卜'等关键词，且用户明确表达了要求你帮忙抽牌的意向时，你看心情调用就行（这意味着你可以拒绝抽塔罗牌，拒绝执行这个动作）。",
-        "用户需要明确指定抽牌范围和抽牌类型，如果用户未明确指定抽牌范围则默认为'全部'，未明确指定抽牌类型则默认为'单张'。",
-        "请仔细辨别对方到底是不是在让你抽塔罗牌！如果用户只是单独说了'抽卡'，'抽牌'，'占卜'，'算命'等，而且并没有上文内容验证用户是想抽塔罗牌的意思，就不要抽塔罗牌，不要执行这个动作！",
-        "在完成一次抽牌后，请仔细确定用户有没有明确要求再抽一次，没有再次要求就不要继续执行这个动作。"
-    ]
-
-    associated_types = ["image", "text"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -104,21 +89,27 @@ class TarotsAction(BaseAction):
             raise
 
     async def execute(self) -> Tuple[bool, str]:
-        """实现基类要求的入口方法"""
+        """执行塔罗牌占卜 - 直接发送图片和简短解读"""
         try:
             if not self.card_map:
                 await self.send_text("❌ 没有可用的牌组，无法进行占卜")
-                return False, "没有牌组，无法使用"
+                return False, "没有牌组"
             
             logger.info("开始执行塔罗占卜")
             
-            # 参数解析
-            request_type = self.action_data.get("card_type", "全部") 
+            # 解析参数
+            request_type = self.action_data.get("card_type", "全部")
             formation_name = self.action_data.get("formation", "单张")
-            card_type = self.get_available_card_type(request_type)
+            target_user = self.action_data.get("target_user", "用户")
+            
+            # 参数映射（支持简写）
+            request_type = self._map_card_type(request_type)
+            formation_name = self._map_formation(formation_name)
+            
+            logger.info(f"占卜参数: card_type={request_type}, formation={formation_name}, target_user={target_user}")
             
             # 参数校验
-            if card_type not in ["全部", "大阿卡纳", "小阿卡纳"]:
+            if request_type not in ["全部", "大阿卡纳", "小阿卡纳"]:
                 await self.send_text("❌ 不存在的抽牌范围")
                 return False, "参数错误"
                 
@@ -133,7 +124,7 @@ class TarotsAction(BaseAction):
             represent_list = formation["represent"]
     
             # 获取有效卡牌范围
-            valid_ids = self._get_card_range(card_type)
+            valid_ids = self._get_card_range(request_type)
             if not valid_ids:
                 await self.send_text("❌ 当前牌组配置错误")
                 return False, "参数错误"
@@ -151,95 +142,57 @@ class TarotsAction(BaseAction):
                     for cid in selected_ids
                 ]
     
-            # 结果处理
-            result_text = f"【{formation_name}牌阵 - {self.using_cards}牌组】\n"
-            card_details = []  # 存储详细的卡牌信息用于AI解读
-            failed_images = []  # 记录获取失败的图片
+            logger.info(f"抽中卡牌: {selected_cards}")
             
-            # 解析目标用户信息
-            reply_to = self.action_data.get("target_message", "")
-            user_nickname = "用户"
-            if reply_to:
-                if ":" in reply_to:
-                    parts = reply_to.split(":", 1)
-                    user_nickname = parts[0].strip()
-                elif "：" in reply_to:
-                    parts = reply_to.split("：", 1)
-                    user_nickname = parts[0].strip()
-
-            # 发送每张卡牌
+            # 1. 立即发送每张牌面图片
+            card_details = []
+            sent_images = []
+            
             for idx, (card_id, is_reverse) in enumerate(selected_cards):
                 card_data = self.card_map.get(card_id, {})
                 if not card_data:
                     logger.warning(f"卡牌ID不存在: {card_id}")
                     continue
                     
-                card_info = card_data.get("info", {})
+                # 发送图片
+                image_sent = await self._send_card_image(card_id, is_reverse)
+                if image_sent:
+                    sent_images.append(card_id)
+                    await asyncio.sleep(0.5)  # 防止消息频率限制
                 
-                # 安全获取位置名称和含义
+                # 收集卡牌信息用于解读
+                card_info = card_data.get("info", {})
                 pos_name = self._get_position_name(represent_list, idx, formation_name)
                 pos_meaning = self._get_position_meaning(represent_list, idx, formation_name)
                 
-                # 发送图片
-                img_success = await self._send_card_image(card_id, is_reverse)
-                if not img_success:
-                    failed_images.append(f"{card_data.get('name', '未知卡牌')}({'逆位' if is_reverse else '正位'})")
-                    logger.warning(f"卡牌图片发送失败: {card_id}")
-                
-                # 构建文本
-                desc = card_info.get('reverseDescription' if is_reverse else 'description', '暂无描述')
-                result_text += (
-                    f"\n{pos_name} - {'逆位' if is_reverse else '正位'} {card_data.get('name', '未知')}\n"
-                    f"{desc[:100]}...\n"
-                )
-                
-                # 存储详细卡牌信息用于AI解读
                 card_details.append({
                     'position': pos_name,
                     'name': card_data.get('name', '未知'),
                     'is_reverse': is_reverse,
-                    'description': desc,
+                    'description': card_info.get('reverseDescription' if is_reverse else 'description', '暂无描述'),
                     'position_meaning': pos_meaning
                 })
-                
-                await asyncio.sleep(0.3)  # 防止消息频率限制
 
-            if failed_images:
-                error_msg = f"❌ 以下卡牌图片获取失败: {', '.join(failed_images)}"
-                await self.send_text(error_msg)
-                return False, "图片获取失败"
-                
-            # 发送最终文本
-            await asyncio.sleep(1.5)
+            if not sent_images:
+                await self.send_text("❌ 卡牌图片发送失败，无法进行占卜")
+                return False, "图片发送失败"
+
+            # 2. 生成并发送简短文字解读
+            await asyncio.sleep(1)  # 给用户一点时间看图片
             
-            # 使用AI重新组织回复
             try:
-                ai_response = await self._generate_ai_interpretation(card_details, formation_name, user_nickname)
-                
-                if ai_response:
-                    # 发送AI解读结果
-                    await self.send_text(ai_response)
-                    
-                    # 如果配置了显示原始文本，也发送原始结果
-                    if self.config["adjustment"].get("enable_original_text", False):
-                        await asyncio.sleep(0.5)
-                        await self.send_text(f"📜 原始牌面信息：\n{result_text}")
-                else:
-                    # 如果AI生成失败，发送原始结果
-                    await self.send_text(f"🔮 塔罗牌启示：\n\n{result_text}\n\n愿这些牌面给你带来启示和力量～")
+                short_interpretation = await self._generate_short_interpretation(card_details, formation_name, target_user)
+                await self.send_text(short_interpretation)
                     
             except Exception as e:
-                logger.error(f"AI回复生成失败: {e}")
-                await self.send_text(f"🔮 塔罗牌启示：\n\n{result_text}\n\n愿这些牌面给你带来启示和力量～")
+                logger.error(f"解读生成失败: {e}")
+                # 发送最简解读
+                card_names = [card['name'] for card in card_details]
+                basic_text = f"✨ 为{target_user}抽到了：{'、'.join(card_names)}～愿塔罗牌给你带来好运！"
+                await self.send_text(basic_text)
 
-            # 记录动作信息
-            await self.store_action_info(
-                action_build_into_prompt=True,
-                action_prompt_display=f"已为{user_nickname}抽取了塔罗牌并成功解牌。",
-                action_done=True
-            )
-
-            return True, f"已为{user_nickname}抽取了塔罗牌并成功解牌"
+            logger.info("塔罗牌占卜执行成功")
+            return True, f"已为{target_user}抽取塔罗牌"
             
         except Exception as e:
             error_msg = traceback.format_exc()
@@ -247,138 +200,112 @@ class TarotsAction(BaseAction):
             await self.send_text(f"❌ 占卜失败: {str(e)}")
             return False, "执行错误"
 
-    def _get_position_name(self, represent_list: List, idx: int, formation_name: str) -> str:
-        """安全获取位置名称"""
+    async def _generate_short_interpretation(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> str:
+        """生成简短自然的解读"""
         try:
-            if (isinstance(represent_list, list) and len(represent_list) > 0 and 
-                isinstance(represent_list[0], list) and idx < len(represent_list[0])):
-                return represent_list[0][idx]
-        except (IndexError, TypeError):
-            pass
-        return f"位置{idx+1}"
-
-    def _get_position_meaning(self, represent_list: List, idx: int, formation_name: str) -> str:
-        """安全获取位置含义"""
-        try:
-            if (isinstance(represent_list, list) and len(represent_list) > 1 and 
-                isinstance(represent_list[1], list) and idx < len(represent_list[1])):
-                return represent_list[1][idx]
-        except (IndexError, TypeError):
-            pass
-        
-        # 根据牌阵类型提供默认含义
-        default_meanings = {
-            "单张": "当前状况或问题的核心",
-            "圣三角": ["过去", "现在", "未来"],
-            "时间之流": ["过去", "现在", "未来"],
-            "四要素": ["火-行动", "水-情感", "风-思想", "土-物质"],
-            "五牌阵": ["现状", "挑战", "最佳选择", "环境", "结果"],
-            "吉普赛十字": ["现状", "障碍", "目标", "过去", "未来"],
-            "马蹄": ["过去", "现在", "隐藏因素", "环境", "期望", "结果"],
-            "六芒星": ["过去", "现在", "未来", "原因", "环境", "结果"]
-        }
-        
-        if formation_name in default_meanings:
-            meanings = default_meanings[formation_name]
-            if isinstance(meanings, list) and idx < len(meanings):
-                return meanings[idx]
-            elif isinstance(meanings, str):
-                return meanings
-        
-        return "未知含义"
-
-    async def _generate_ai_interpretation(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> Optional[str]:
-        """生成AI自然语言解读"""
-        try:
-            # 构建详细的解读提示词
-            prompt = self._build_interpretation_prompt(card_details, formation_name, user_nickname)
+            # 使用AI生成简短解读
+            prompt = self._build_short_prompt(card_details, formation_name, user_nickname)
             
-            # 使用聊天API生成回复
-            if hasattr(chat_api, 'generate_response'):
-                response = await chat_api.generate_response(
-                    prompt=prompt,
-                    context=self.chat_stream,
-                    max_tokens=800,
-                    temperature=0.8
-                )
-                return response
+            models = llm_api.get_available_models()
+            chat_model_config = models.get("replyer")
+
+            success, thinking_result, _, _ = await llm_api.generate_with_model(
+                prompt, model_config=chat_model_config, request_type="tarots_interpretation"
+            )
+
+            if success and len(thinking_result) < 100:  # 确保回复简短
+                return thinking_result
             else:
-                # 如果聊天API不可用，使用备用解读
-                return self._generate_fallback_interpretation(card_details, formation_name, user_nickname)
+                # 如果AI回复太长或失败，使用备用简短解读
+                return self._generate_fallback_short_interpretation(card_details, formation_name, user_nickname)
                 
         except Exception as e:
             logger.error(f"AI解读生成错误: {e}")
-            return None
+            return self._generate_fallback_short_interpretation(card_details, formation_name, user_nickname)
 
-    def _build_interpretation_prompt(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> str:
-        """构建解读提示词"""
+    def _build_short_prompt(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> str:
+        """构建简短解读提示词"""
         cards_info = ""
         for card in card_details:
-            position_desc = f"{card['position']}（代表{card['position_meaning']}）"
             status = "逆位" if card['is_reverse'] else "正位"
-            cards_info += f"- {position_desc}：{card['name']}（{status}）\n  含义：{card['description']}\n\n"
+            cards_info += f"{card['name']}（{status}）"
 
-        prompt = f"""你是一位资深的塔罗牌占卜师，请为{user_nickname}进行塔罗牌解读。
+        prompt = f"""请用轻松自然的语气为{user_nickname}解读塔罗牌，保持非常简短（2-3句话）。
 
-牌阵：{formation_name}
-抽到的卡牌信息：
-{cards_info}
+抽到的牌：{cards_info}
 
-请根据以上信息，用温暖、亲切、富有诗意的语言为用户进行解读：
+请用1句话总结牌面意思，再用1句话给出实用建议。
+就像朋友聊天一样自然，不要用专业术语，不要讲大道理。
+可以带点小幽默，保持温暖亲切。
 
-1. 首先用一句神秘而温暖的开场白开始
-2. 分析每张牌在各自位置上的含义，结合牌阵的整体能量
-3. 重点解读逆位牌的特殊含义和警示
-4. 给出整体的运势分析和建议
-5. 用积极鼓励的话语结束解读
-
-请使用自然的口语化表达，避免过于专业的术语，让用户感受到关怀和启发。可以适当使用emoji增加亲和力。
-
-你的解读："""
+你的解读（请控制在50字以内）："""
 
         return prompt
 
-    def _generate_fallback_interpretation(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> str:
-        """生成备用解读（当AI不可用时）"""
-        interpretation = f"🔮 亲爱的{user_nickname}，让我为你解读这次的塔罗牌～\n\n"
-        
-        # 分析每张牌
-        reverse_cards = [card for card in card_details if card['is_reverse']]
-        normal_cards = [card for card in card_details if not card['is_reverse']]
-        
-        if reverse_cards:
-            interpretation += f"🌟 在这次{formation_name}牌阵中，你抽到了{len(reverse_cards)}张逆位牌，这提醒你要特别留意某些方面的平衡。\n\n"
+    def _generate_fallback_short_interpretation(self, card_details: List[Dict], formation_name: str, user_nickname: str) -> str:
+        """生成备用简短解读"""
+        card_names = []
+        reverse_count = 0
         
         for card in card_details:
-            status_emoji = "⚠️" if card['is_reverse'] else "✨"
-            interpretation += f"{status_emoji} **{card['position']}** - {card['name']}{'（逆位）' if card['is_reverse'] else ''}\n"
-            interpretation += f"   这代表着{card['position_meaning']}，{card['description']}\n\n"
+            status = "逆位" if card['is_reverse'] else "正位"
+            card_names.append(f"{card['name']}（{status}）")
+            if card['is_reverse']:
+                reverse_count += 1
+    
+        card_list = "、".join(card_names)
         
-        # 整体建议
-        interpretation += "💫 **整体启示**：\n"
-        if len(normal_cards) > len(reverse_cards):
-            interpretation += "牌面整体能量积极，当前时机对你有利，请保持信心继续前进～"
-        elif len(reverse_cards) > len(normal_cards):
-            interpretation += "牌面提醒你需要更多反思和调整，但这也是成长的契机，相信你能处理好！"
+        # 根据逆位牌数量给出不同语气
+        if reverse_count == len(card_details):
+            # 全是逆位
+            interpretations = [
+                f"🌙 哇{user_nickname}，抽到了{card_list}～看来最近需要放慢脚步调整一下呢！",
+                f"🌀 {user_nickname}的牌面是{card_list}～能量有点特别，给自己多点耐心哦！",
+                f"💫 抽到{card_list}呢{user_nickname}～最近可能有些小挑战，但都是成长的机会！"
+            ]
+        elif reverse_count > 0:
+            # 有逆位牌
+            interpretations = [
+                f"✨ {user_nickname}抽到了{card_list}～牌面有些小波动，不过问题不大！",
+                f"🌟 为{user_nickname}抽到{card_list}～有些地方可能需要微调，但整体还不错！",
+                f"🔮 {user_nickname}的塔罗牌是{card_list}～能量有起有伏，保持平常心就好～"
+            ]
         else:
-            interpretation += "牌面能量平衡，既有挑战也有机遇，保持平和心态最重要～"
+            # 全是正位
+            interpretations = [
+                f"💖 {user_nickname}抽到了{card_list}～牌面能量超棒，继续保持！",
+                f"⭐ 哇{user_nickname}，{card_list}～都是正位呢，最近运势不错哦！",
+                f"🌞 {user_nickname}的塔罗牌是{card_list}～能量很正向，放心前进吧！"
+            ]
         
-        interpretation += f"\n\n愿塔罗的智慧为{user_nickname}带来光明与指引 🌟"
-        
-        return interpretation
+        return random.choice(interpretations)
 
-    def _get_card_range(self, card_type: str) -> list:
-        """获取卡牌范围"""
-        if card_type == "大阿卡纳":
-            return [str(i) for i in range(22)]
-        elif card_type == "小阿卡纳":
-            return [str(i) for i in range(22, 78)]
-        return [str(i) for i in range(78)]
+    def _map_card_type(self, card_type: str) -> str:
+        """映射卡牌类型参数"""
+        mapping = {
+            "全": "全部", "全部": "全部",
+            "大": "大阿卡纳", "大阿": "大阿卡纳", "大阿卡纳": "大阿卡纳",
+            "小": "小阿卡纳", "小阿": "小阿卡纳", "小阿卡纳": "小阿卡纳"
+        }
+        return mapping.get(card_type, card_type)
+
+    def _map_formation(self, formation: str) -> str:
+        """映射牌阵参数"""
+        mapping = {
+            "单": "单张", "单张": "单张",
+            "圣": "圣三角", "圣三角": "圣三角",
+            "时": "时间之流", "时间": "时间之流", "时间之流": "时间之流",
+            "四": "四要素", "四要素": "四要素",
+            "五": "五牌阵", "五牌": "五牌阵", "五牌阵": "五牌阵",
+            "吉": "吉普赛十字", "吉普赛": "吉普赛十字", "吉普赛十字": "吉普赛十字",
+            "马": "马蹄", "马蹄": "马蹄",
+            "六": "六芒星", "六芒": "六芒星", "六芒星": "六芒星"
+        }
+        return mapping.get(formation, formation)
 
     async def _send_card_image(self, card_id: str, is_reverse: bool) -> bool:
-        """发送卡牌图片 - 从本地目录获取并发送"""
+        """发送卡牌图片"""
         try:
-            # 直接从本地牌组目录获取图片
             card_data = self.card_map.get(card_id, {})
             if not card_data:
                 logger.error(f"卡牌ID不存在: {card_id}")
@@ -413,7 +340,7 @@ class TarotsAction(BaseAction):
         except Exception as e:
             logger.error(f"发送本地图片失败: {str(e)}")
             return False
-    
+
     def _get_local_image_filename(self, card_name: str, is_reverse: bool) -> str:
         """根据卡牌名称和位置构建本地图片文件名"""
         # 处理卡牌名称中的特殊字符和空格
@@ -424,6 +351,54 @@ class TarotsAction(BaseAction):
         filename = f"{cleaned_name}{position}.jpg"
         
         return filename
+
+    def _get_card_range(self, card_type: str) -> list:
+        """获取卡牌范围"""
+        if card_type == "大阿卡纳":
+            return [str(i) for i in range(22)]
+        elif card_type == "小阿卡纳":
+            return [str(i) for i in range(22, 78)]
+        return [str(i) for i in range(78)]
+
+    def _get_position_name(self, represent_list: List, idx: int, formation_name: str) -> str:
+        """安全获取位置名称"""
+        try:
+            if (isinstance(represent_list, list) and len(represent_list) > 0 and 
+                isinstance(represent_list[0], list) and idx < len(represent_list[0])):
+                return represent_list[0][idx]
+        except (IndexError, TypeError):
+            pass
+        return f"位置{idx+1}"
+
+    def _get_position_meaning(self, represent_list: List, idx: int, formation_name: str) -> str:
+        """安全获取位置含义"""
+        try:
+            if (isinstance(represent_list, list) and len(represent_list) > 1 and 
+                isinstance(represent_list[1], list) and idx < len(represent_list[1])):
+                return represent_list[1][idx]
+        except (IndexError, TypeError):
+            pass
+        
+        # 根据牌阵类型提供默认含义
+        default_meanings = {
+            "单张": "当前状况",
+            "圣三角": ["过去", "现在", "未来"],
+            "时间之流": ["过去", "现在", "未来"],
+            "四要素": ["行动", "情感", "思想", "物质"],
+            "五牌阵": ["现状", "挑战", "选择", "环境", "结果"],
+            "吉普赛十字": ["现状", "障碍", "目标", "过去", "未来"],
+            "马蹄": ["过去", "现在", "隐藏", "环境", "期望", "结果"],
+            "六芒星": ["过去", "现在", "未来", "原因", "环境", "结果"]
+        }
+        
+        if formation_name in default_meanings:
+            meanings = default_meanings[formation_name]
+            if isinstance(meanings, list) and idx < len(meanings):
+                return meanings[idx]
+            elif isinstance(meanings, str):
+                return meanings
+        
+        return "未知"
 
     def _load_config(self) -> Dict[str, Any]:
         """加载配置"""
@@ -533,11 +508,6 @@ class TarotsAction(BaseAction):
         except Exception as e:
             logger.error(f"更新牌组配置失败: {e}")
 
-    def _check_cards(self, cards: str) -> bool:
-        """检查牌组是否可用"""
-        use_cards = self.config["cards"].get("use_cards", ['bilibili','east'])
-        return cards in use_cards
-    
     def set_card(self, cards: str):
         """设置当前使用牌组"""
         try:
@@ -552,169 +522,6 @@ class TarotsAction(BaseAction):
         except Exception as e:
             logger.error(f"更新使用牌组失败: {e}")
 
-# TarotsCommand 类保持不变（与之前相同）
-class TarotsCommand(BaseCommand):
-    command_name = "tarots"
-    command_description = "塔罗牌管理命令"
-    command_pattern = r"^/tarots\s+(?P<target_type>\w+)(?:\s+(?P<action_value>\w+))?\s*$"
-    command_help = "使用方法: /tarots check - 检查牌组完整性; /tarots switch 牌组名称 - 切换牌组"
-    command_examples = [
-        "/tarots check - 检查当前牌组完整性",
-        "/tarots switch bilibili - 切换至bilibili牌组"
-    ]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # 初始化与TarotsAction相同的资源
-        self.base_dir = Path(__file__).parent.absolute()
-        self.config = self._load_config()
-        self.using_cards = self.config["cards"].get("using_cards", 'bilibili')
-        self.card_map = {}
-        self.formation_map = {}
-        self._load_resources()
-
-    def _load_config(self):
-        """加载配置"""
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            config_path = os.path.join(script_dir, "config.toml")
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return toml.load(f)
-        except Exception:
-            return {"cards": {"using_cards": "bilibili", "use_cards": ["bilibili", "east"]}}
-
-    def _load_resources(self):
-        """加载资源"""
-        try:
-            if not self.using_cards:
-                return
-            
-            cards_json_path = self.base_dir / f"tarot_jsons/{self.using_cards}/tarots.json"
-            if cards_json_path.exists():
-                with open(cards_json_path, encoding="utf-8") as f:
-                    self.card_map = json.load(f)
-            
-            formation_json_path = self.base_dir / "tarot_jsons/formation.json"
-            if formation_json_path.exists():
-                with open(formation_json_path, encoding="utf-8") as f:
-                    self.formation_map = json.load(f)
-                    
-        except Exception as e:
-            logger.error(f"资源加载失败: {e}")
-
-    async def execute(self) -> Tuple[bool, str, bool]:
-        """执行命令"""
-        try:
-            # 权限检查
-            sender_id = str(self.message.message_info.user_info.user_id)
-            if not self._check_person_permission(sender_id):
-                await self.send_text("❌ 权限不足，你无权使用此命令")    
-                return False, "权限不足", True
-            
-            if not self.card_map:
-                await self.send_text("❌ 没有可用的牌组")
-                return False, "没有牌组", True
-                
-            target_type = self.matched_groups.get("target_type", "")
-            action_value = self.matched_groups.get("action_value", "")
-            
-            if target_type == "check" and not action_value:
-                return await self._check_card_set()
-            elif target_type == "switch" and action_value:
-                return await self._switch_card_set(action_value)
-            else:
-                await self.send_text("❌ 参数错误，使用 /tarots help 查看帮助")
-                return False, "参数错误", True
-
-        except Exception as e:
-            logger.error(f"命令执行错误: {e}")
-            await self.send_text(f"❌ 命令执行失败: {str(e)}")
-            return False, f"执行失败: {str(e)}", True
-
-    async def _check_card_set(self) -> Tuple[bool, str, bool]:
-        """检查牌组完整性"""
-        await self.send_text("🔍 正在检查牌组完整性...")
-        
-        if not self.card_map:
-            await self.send_text("❌ 牌组数据加载失败")
-            return False, "牌组数据加载失败", True
-
-        missing_cards = []
-        total_cards = 0
-        
-        # 检查所有卡牌的图片文件是否存在
-        for card_id, card_data in self.card_map.items():
-            if card_id == "_meta":
-                continue
-                
-            total_cards += 1
-            card_name = card_data.get("name", "")
-            
-            if card_name:
-                # 检查正位图片
-                normal_filename = self._get_local_image_filename(card_name, False)
-                normal_path = self.base_dir / f"tarot_jsons/{self.using_cards}" / normal_filename
-                
-                # 检查逆位图片
-                reverse_filename = self._get_local_image_filename(card_name, True)
-                reverse_path = self.base_dir / f"tarot_jsons/{self.using_cards}" / reverse_filename
-                
-                if not normal_path.exists() or not reverse_path.exists():
-                    missing_cards.append(card_name)
-
-        if not missing_cards:
-            await self.send_text(f"✅ 牌组完整性检查通过！共检查 {total_cards} 张卡牌，所有图片文件完整。")
-            return True, "牌组完整性检查通过", True
-        else:
-            missing_list = "\n".join([f"• {card}" for card in missing_cards])
-            await self.send_text(f"❌ 发现 {len(missing_cards)} 张卡牌图片缺失：\n{missing_list}")
-            return False, f"发现 {len(missing_cards)} 张卡牌图片缺失", True
-
-    def _get_local_image_filename(self, card_name: str, is_reverse: bool) -> str:
-        """根据卡牌名称和位置构建本地图片文件名"""
-        # 处理卡牌名称中的特殊字符和空格
-        cleaned_name = card_name.replace("ACE", "王牌").replace("2", "二").replace("3", "三").replace("4", "四").replace("5", "五").replace("6", "六").replace("7", "七").replace("8", "八").replace("9", "九").replace("10", "十")
-        
-        # 构建文件名
-        position = "逆位" if is_reverse else "正位"
-        filename = f"{cleaned_name}{position}.jpg"
-        
-        return filename
-
-    async def _switch_card_set(self, card_set: str) -> Tuple[bool, str, bool]:
-        """切换牌组"""
-        if self._check_cards(card_set):
-            self._set_card_config(card_set)
-            await self.send_text(f"✅ 已切换牌组至: {card_set}")
-            return True, f"切换牌组至 {card_set}", True
-        else:
-            available_sets = self.config["cards"].get("use_cards", [])
-            await self.send_text(f"❌ 牌组 {card_set} 不可用，可用牌组: {', '.join(available_sets)}")
-            return False, f"牌组 {card_set} 不可用", True
-
-    def _check_person_permission(self, user_id: str) -> bool:
-        """权限检查"""
-        admin_users = self.config.get("permissions", {}).get("admin_users", [])
-        return user_id in admin_users
-
-    def _check_cards(self, cards: str) -> bool:
-        """检查牌组是否可用"""
-        use_cards = self.config["cards"].get("use_cards", ['bilibili','east'])
-        return cards in use_cards
-
-    def _set_card_config(self, card_set: str):
-        """设置牌组配置"""
-        try:
-            config_path = self.base_dir / "config.toml"
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = tomlkit.load(f)
-                config_data["cards"]["using_cards"] = card_set
-            
-            with open(config_path, 'w', encoding='utf-8') as f:
-                tomlkit.dump(config_data, f)
-        except Exception as e:
-            logger.error(f"更新牌组配置失败: {e}")
-
 @register_plugin
 class TarotsPlugin(BasePlugin):
     """塔罗牌插件 - 支持多种牌阵和卡牌类型的占卜功能"""
@@ -725,9 +532,9 @@ class TarotsPlugin(BasePlugin):
     dependencies = []
     python_dependencies = ["Pillow", "aiohttp", "tomlkit"]
 
-    plugin_description = "塔罗牌占卜插件，支持多种牌阵和卡牌类型，提供智能AI解读"
+    plugin_description = "塔罗牌占卜插件，支持多种牌阵和卡牌类型，提供简短自然解读"
     plugin_version = "2.2.1"
-    plugin_author = "升级版 - 智能解读"
+    plugin_author = "升级版 - 简短解读"
 
     config_section_descriptions = {
         "plugin": "插件基本配置",
@@ -745,7 +552,6 @@ class TarotsPlugin(BasePlugin):
         },
         "components": {
             "enable_tarots": ConfigField(type=bool, default=True, description="启用塔罗牌占卜功能"),
-            "enable_tarots_command": ConfigField(type=bool, default=True, description="启用塔罗牌管理命令")
         },
         "proxy": {
             "enable_proxy": ConfigField(type=bool, default=False, description="是否启用代理"),
@@ -770,8 +576,5 @@ class TarotsPlugin(BasePlugin):
 
         if self.get_config("components.enable_tarots", True):
             components.append((TarotsAction.get_action_info(), TarotsAction))
-
-        if self.get_config("components.enable_tarots_command", True):
-            components.append((TarotsCommand.get_command_info(), TarotsCommand))
 
         return components
